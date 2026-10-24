@@ -7,7 +7,7 @@ import dynamic from 'next/dynamic';
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { ArrowLeft, ArrowUpRight, Volume2, VolumeX, Send, RotateCcw, Pause, Play, Square, ArrowRight, Check } from 'lucide-react';
 import { useDemoSession } from '@/lib/demo-session';
-import { STATUS_LABELS, type DemoAction, type DemoWorld, type DemoState } from '@/lib/demo-types';
+import { GUIDE_FOLLOW_DISTANCE_M, navigationForState, pointAtDistance, STATUS_LABELS, worldToMapPoint, type DemoAction, type DemoWorld, type DemoState } from '@/lib/demo-types';
 import { createSpeechPlayer } from './speech';
 import styles from './experience.module.css';
 
@@ -17,29 +17,42 @@ type ChatLine = { role: 'user' | 'assistant'; text: string };
 function RouteMap({ world, state }: { world: DemoWorld; state: DemoState | null }) {
   const map = world.map;
   if (!map) return null;
-  const points = map.route;
-  let remaining = state?.distance_m ?? 0;
-  let current = points[0];
-  for (let i = 1; i < points.length; i++) {
-    const a = points[i - 1], b = points[i];
-    const length = Math.hypot(b[0] - a[0], b[1] - a[1]);
-    const t = Math.max(0, Math.min(1, remaining / length));
-    current = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
-    if (remaining <= length) break;
-    remaining -= length;
-  }
+  const navigation = navigationForState(world, state);
+  const toMap = (point: DemoWorld['route']['points'][number]) => worldToMapPoint(point, world.transform);
+  const points = navigation.points.map(toMap);
+  const dogPose = pointAtDistance(navigation.points, state?.distance_m ?? 0);
+  const dog = toMap(dogPose.point);
+  const human = toMap(pointAtDistance(navigation.points, (state?.distance_m ?? 0) - GUIDE_FOLLOW_DISTANCE_M, true).point);
+  const headingAngle = (point: DemoWorld['route']['points'][number], heading: number) => {
+    const from = toMap(point);
+    const to = toMap({ ...point, x: point.x + Math.sin(heading), z: point.z + Math.cos(heading) });
+    return Math.atan2(from[1] - to[1], to[0] - from[0]) * 180 / Math.PI;
+  };
+  // Keep the same useful map extent through replanning, with room for the detour.
+  const original = world.route.points.map(toMap);
+  const left = Math.max(0, Math.min(...original.map(point => point[0])) - 18);
+  const right = Math.min(map.width_m, Math.max(...original.map(point => point[0])) + 18);
+  const bottom = Math.max(0, Math.min(...original.map(point => point[1])) - 18);
+  const top = Math.min(map.height_m, Math.max(...original.map(point => point[1])) + 18);
   const pointList = (poly: number[][]) => poly.map(([x, y]) => `${x},${map.height_m - y}`).join(' ');
-  return <svg className={styles.routeMap} viewBox={`0 0 ${map.width_m} ${map.height_m}`} role="img" aria-label={`路线简图，${world.route.start_name}前往${world.route.destination_name}`}>
+  return <><svg className={styles.routeMap} viewBox={`${left} ${map.height_m - top} ${right - left} ${top - bottom}`} role="img" aria-label={`路线简图，${world.route.start_name}前往${world.route.destination_name}，显示当前路线、人和机器狗，以及 ${state?.obstacles?.length ?? 0} 处固定障碍`}>
     <rect width={map.width_m} height={map.height_m} fill="#eeefe8" />
     {map.roads.map((poly, index) => <polygon key={`r${index}`} points={pointList(poly)} fill="#dbdcd4" />)}
     {map.walks.map((poly, index) => <polygon key={`w${index}`} points={pointList(poly)} fill="#fafbf7" />)}
     {map.buildings.map((building, index) => <polygon key={`b${index}`} points={pointList(building.poly)} fill="#b8bbae" />)}
-    <polyline points={pointList(points)} fill="none" stroke="#353b29" strokeWidth="4" strokeLinejoin="round" />
-    <polyline points={pointList(points)} fill="none" stroke="#d2ff00" strokeWidth="2" strokeLinejoin="round" />
-    <circle cx={points[0][0]} cy={map.height_m - points[0][1]} r="3" fill="#353b29" />
-    <circle cx={points[points.length - 1][0]} cy={map.height_m - points[points.length - 1][1]} r="4" fill="#fafbf7" stroke="#353b29" strokeWidth="1.5" />
-    <circle cx={current[0]} cy={map.height_m - current[1]} r="4" fill="#d2ff00" stroke="#25281f" strokeWidth="2" />
-  </svg>;
+    <polyline points={pointList(points)} fill="none" stroke="#353b29" strokeWidth="2" strokeLinejoin="round" />
+    <polyline points={pointList(points)} fill="none" stroke="#d2ff00" strokeWidth="0.9" strokeLinejoin="round" />
+    <circle cx={points[0][0]} cy={map.height_m - points[0][1]} r="1.5" fill="#353b29" />
+    <circle cx={points[points.length - 1][0]} cy={map.height_m - points[points.length - 1][1]} r="2.3" fill="#fafbf7" stroke="#353b29" strokeWidth="1" />
+    {state?.obstacles?.map(obstacle => {
+      const point = toMap(obstacle.point);
+      return <g key={obstacle.id} data-map-obstacle={obstacle.id} transform={`translate(${point[0]} ${map.height_m - point[1]}) rotate(${headingAngle(obstacle.point, obstacle.heading)})`}>
+        <rect x="-0.8" y="-2.5" width="1.6" height="5" rx="0.3" fill="#73511e" stroke="#fff" strokeWidth="0.6" />
+      </g>;
+    })}
+    <circle data-map-character="human" cx={human[0]} cy={map.height_m - human[1]} r="1.3" fill="#fff" stroke="#25281f" strokeWidth="0.9" />
+    <path data-map-character="dog" d="M 2.1 0 L -1.2 -1.3 L -0.65 0 L -1.2 1.3 Z" transform={`translate(${dog[0]} ${map.height_m - dog[1]}) rotate(${headingAngle(dogPose.point, dogPose.heading)})`} fill="#d2ff00" stroke="#25281f" strokeWidth="0.7" strokeLinejoin="round" />
+  </svg><div className={styles.mapLegend} aria-hidden="true"><span><i className={styles.mapDog} />狗</span><span><i className={styles.mapHuman} />人</span><span><i className={styles.mapObstacle} />障碍</span></div></>;
 }
 
 export default function Experience() {
@@ -85,15 +98,16 @@ export default function Experience() {
   const stateStatus = state?.status;
   const stateStep = state?.current_step;
   const obstacleActive = state?.obstacle_active;
+  const detourUntil = state?.detour_until_m;
   useEffect(() => {
     const snapshot = stateRef.current;
     if (!snapshot) return;
-    const key = `${snapshot.session_id}:${snapshot.status}:${snapshot.current_step}:${snapshot.obstacle_active}`;
+    const key = `${snapshot.session_id}:${snapshot.status}:${snapshot.current_step}:${snapshot.obstacle_active}:${snapshot.detour_until_m}`;
     if (key === lastAnnouncement.current) return;
     lastAnnouncement.current = key;
     announce(snapshot.message);
     speak(snapshot.message);
-  }, [stateRef, stateStatus, stateStep, obstacleActive, speak, announce]);
+  }, [stateRef, stateStatus, stateStep, obstacleActive, detourUntil, speak, announce]);
 
   useEffect(() => {
     const id = state?.session_id;
@@ -156,15 +170,19 @@ export default function Experience() {
     else speechPlayer.current?.stop();
   };
   const ready = connection === 'online' && !!state && !busy;
-  const progress = world && state ? Math.max(0, Math.min(100, state.distance_m / world.route.total_distance_m * 100)) : 0;
+  const navigation = world ? navigationForState(world, state) : null;
+  const totalDistance = navigation?.total_distance_m ?? 150;
+  const progress = state ? Math.max(0, Math.min(100, state.distance_m / totalDistance * 100)) : 0;
+  const detouring = !!state && ['ACTIVE', 'PAUSED'].includes(state.status) && state.detour_until_m != null && state.distance_m < state.detour_until_m;
   const primary = state?.status === 'ACTIVE' ? { action: 'pause' as const, label: '停下', icon: Pause }
-    : state?.status === 'PAUSED' ? { action: 'resume' as const, label: '继续前进', icon: Play }
+    : state?.status === 'PAUSED' ? { action: 'resume' as const, label: state.obstacle_active ? '绕行前进' : '继续前进', icon: Play }
     : state?.status === 'DONE' || state?.status === 'CANCELLED' ? { action: 'reset' as const, label: '再来一次', icon: RotateCcw }
     : { action: 'start' as const, label: '开始体验', icon: Play };
   const PrimaryIcon = primary.icon;
-  const primaryUnavailable = !ready || (primary.action === 'resume' && !!state?.obstacle_active);
+  const primaryUnavailable = !ready;
   const journeyUnavailable = !ready || !['ACTIVE', 'PAUSED'].includes(state?.status ?? '');
-  const statusLabel = state ? STATUS_LABELS[state.status] : '准备连接';
+  const obstacleUnavailable = journeyUnavailable || (!state?.obstacle_active && detouring);
+  const statusLabel = state?.status === 'ACTIVE' && detouring ? '正在绕行' : state ? STATUS_LABELS[state.status] : '准备连接';
   const connectionText = connection === 'online' ? '已连接' : connection === 'loading' ? '正在连接…' : connection === 'reconnecting' ? '连接中断，正在恢复…' : '连接未完成';
 
   return <main className={styles.experience}>
@@ -196,29 +214,34 @@ export default function Experience() {
         <section className={styles.journey} id="journey-controls" aria-labelledby="journey-title">
           <div className={styles.sectionHeading}><h2 id="journey-title">这段路，一起走</h2><span className={styles.status} data-active={state?.status === 'ACTIVE'}>{statusLabel}</span></div>
           <p className={styles.instruction}>{state?.message || '连上绒途后，就可以开始这段城市旅程。'}</p>
-          <div className={styles.progressLabel}><span>已行进 <strong>{(state?.distance_m ?? 0).toFixed(1)}</strong> 米</span><span>全程 {world?.route.total_distance_m ?? 150} 米</span></div>
-          <div className={styles.progressTrack} role="progressbar" aria-label="路线行进进度" aria-valuemin={0} aria-valuemax={world?.route.total_distance_m ?? 150} aria-valuenow={Math.round(state?.distance_m ?? 0)}><span style={{ width: `${progress}%` }} /></div>
+          <div className={styles.progressLabel}><span>已行进 <strong>{(state?.distance_m ?? 0).toFixed(1)}</strong> 米</span><span>全程 {totalDistance.toFixed(1)} 米</span></div>
+          <div className={styles.progressTrack} role="progressbar" aria-label="路线行进进度" aria-valuemin={0} aria-valuemax={totalDistance} aria-valuenow={Math.min(totalDistance, Math.max(0, state?.distance_m ?? 0))} aria-valuetext={`已行进 ${(state?.distance_m ?? 0).toFixed(1)} 米，全程 ${totalDistance.toFixed(1)} 米`}><span style={{ width: `${progress}%` }} /></div>
           <div className={styles.mainControls} aria-busy={busy}>
             <button className={styles.primary} onClick={() => void run(primary.action, primaryUnavailable)} aria-disabled={primaryUnavailable}><PrimaryIcon size={17} aria-hidden="true" />{busy ? '正在处理…' : primary.label}</button>
             <button onClick={() => void run('cancel', journeyUnavailable)} aria-disabled={journeyUnavailable}><Square size={15} aria-hidden="true" />结束</button>
           </div>
           <div className={styles.auxControls}>
-            <button onClick={() => void run(state?.obstacle_active ? 'obstacle_clear' : 'obstacle', journeyUnavailable)} aria-disabled={journeyUnavailable}>{state?.obstacle_active ? '清除障碍' : '模拟障碍'}</button>
+            <button onClick={() => void run(state?.obstacle_active ? 'obstacle_bypass' : 'obstacle', obstacleUnavailable)} aria-disabled={obstacleUnavailable}>{state?.obstacle_active ? '绕行障碍' : detouring ? '绕行中' : '模拟障碍'}</button>
             <button onClick={toggleSpeech} disabled={!speechAvailable} aria-pressed={speech}>{speech ? <Volume2 size={16} aria-hidden="true" /> : <VolumeX size={16} aria-hidden="true" />}{speechAvailable ? (speech ? '播报已开启' : '开启播报') : '使用文字提示'}</button>
           </div>
           {speechError && <p className={styles.hint}>{speechError}</p>}
-          {state?.obstacle_active && <p className={styles.hint}>障碍清除后，点击“继续前进”再出发。</p>}
+          {state?.obstacle_active && <p className={styles.hint}>前方有障碍。点击“绕行前进”，或输入“绕行”，绒途会带你从旁边经过。</p>}
+          {!state?.obstacle_active && detouring && ['ACTIVE', 'PAUSED'].includes(state?.status ?? '') && <p className={styles.hint}>{state?.status === 'PAUSED' ? '绕行已暂停，点击“继续前进”沿当前路线继续。' : '正在沿新路线绕过障碍，人和绒途通过后回到原路线。'}</p>}
           {(error || connection === 'reconnecting' || notice) && <div className={styles.notice} role="status">
             <p>{error || (connection === 'reconnecting' ? '正在恢复连接。画面会暂时停住；长时间离线后，需要手动继续。' : notice)}</p>
             {(error || connection === 'reconnecting') && <button onClick={retry}>重新连接 <ArrowUpRight size={14} aria-hidden="true" /></button>}
           </div>}
           <ol className={styles.steps} aria-label="路线步骤">
             {world?.route.steps.map(step => {
-              const complete = !!state && (state.distance_m >= step.end_m || state.status === 'DONE');
+              const end = navigation?.step_end_distances[step.index] ?? step.end_m;
+              const start = step.index === 0 ? 0 : navigation?.step_end_distances[step.index - 1] ?? step.start_m;
+              const addedDistance = end - start - step.distance_m;
+              const instruction = addedDistance > 0.05 ? `${step.instruction.replace(/约\s*[\d.]+\s*米/, `约 ${Math.round(end - start)} 米`)}（含绕行）` : step.instruction;
+              const complete = !!state && (state.distance_m >= end || state.status === 'DONE');
               const current = !complete && state?.current_step === step.index;
               return <li key={step.index} aria-current={current ? 'step' : undefined} data-complete={complete}>
                 <span className={styles.stepMarker} aria-hidden="true">{complete ? <Check size={13} /> : current ? <ArrowRight size={13} /> : <i />}</span>
-                <span>{step.instruction}</span>
+                <span>{instruction}</span>
               </li>;
             })}
           </ol>
@@ -233,7 +256,7 @@ export default function Experience() {
             <label htmlFor="demo-message">想去哪里，或需要停下？</label>
             <div><input id="demo-message" value={text} onChange={event => setText(event.target.value)} placeholder="例如：带我去街心花园" maxLength={300} disabled={!state} autoComplete="off" /><button type="submit" aria-label="发送文字指令" aria-disabled={!ready || !text.trim()}><Send size={18} aria-hidden="true" /></button></div>
           </form>
-          <p className={styles.textHint}>可以说“停下”“继续”或“结束导航”。</p>
+          <p className={styles.textHint}>可以说“停下”“继续”“绕行”或“结束导航”。</p>
         </section>
       </aside>
     </div>

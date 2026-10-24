@@ -44,6 +44,12 @@
 .canvasCaption span:first-child { color: var(--text); }
 .minimap { width: 172px; position: absolute; bottom: 16px; right: 16px; border: 3px solid var(--surface); border-radius: 8px; overflow: hidden; pointer-events: none; }
 .routeMap { display: block; width: 100%; height: auto; }
+.mapLegend { display: flex; justify-content: center; gap: 8px; padding: 4px 2px; font-size: 11px; background: var(--surface); color: var(--muted); }
+.mapLegend span { display: inline-flex; align-items: center; gap: 3px; }
+.mapLegend i { display: inline-block; flex: none; }
+.mapDog { width: 0; height: 0; border-top: 3px solid transparent; border-bottom: 3px solid transparent; border-left: 6px solid var(--text); }
+.mapHuman { width: 6px; height: 6px; border: 1px solid var(--text); border-radius: 50%; }
+.mapObstacle { width: 3px; height: 7px; background: #73511e; }
 .sceneFooter { padding: 12px 20px; display: flex; justify-content: space-between; gap: 16px; font-size: 12px; color: var(--muted); }
 .controlPanel { min-width: 0; display: flex; flex-direction: column; border: 1px solid var(--edge); background: var(--surface); border-radius: 16px; overflow: hidden; }
 .journey { padding: 20px; }
@@ -112,7 +118,7 @@
   .canvasArea { height: 44svh; min-height: 300px; flex: none; }
   .canvasCaption { left: 10px; top: 10px; right: 10px; width: fit-content; font-size: 12px; }
   .canvasCaption span:last-child { display: none; }
-  .minimap { width: 104px; right: 10px; bottom: 10px; border-width: 2px; }
+  .minimap { width: 104px; left: 10px; right: auto; bottom: 10px; border-width: 2px; }
   .sceneFooter { padding: 10px 16px; font-size: 12px; }
   .sceneFooter span:last-child { display: none; }
   .controlPanel { grid-template-columns: 1fr; border: 0; border-radius: 0; }

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import time
 from urllib.parse import urlsplit, urlunsplit
 
@@ -201,6 +202,8 @@ async def full_route(check):
     data = await check.create()
     started = time.monotonic()
     obstacle_seen = False
+    fixed_obstacles = None
+    detour_navigation = None
     next_report = 0
     async with LiveSession(check, data) as live:
         await live.ping()
@@ -213,34 +216,95 @@ async def full_route(check):
             assert elapsed < 180, 'Full route exceeded the 180-second allowance'
             state = live.latest
             if elapsed >= next_report:
-                report(f"路线验收 {elapsed:5.1f}s  {state['status']:9s}  {state['distance_m']:6.2f} / 150m  第 {min(state['current_step'] + 1, len(route['steps']))} 步")
+                report(f"路线验收 {elapsed:5.1f}s  {state['status']:9s}  {state['distance_m']:6.2f} / {state['navigation']['total_distance_m']:.4f}m  第 {min(state['current_step'] + 1, len(route['steps']))} 步")
                 next_report = elapsed + 10
+            if fixed_obstacles is not None:
+                assert state['obstacles'] == fixed_obstacles, 'The physical obstacle moved or disappeared'
+                assert state['navigation'] == detour_navigation, 'A repeated request changed the chosen detour'
             if state['status'] == 'PAUSED':
                 assert state['pause_reason'] == 'obstacle' and not obstacle_seen
                 assert state['distance_m'] == 32 and state['obstacle_active']
                 obstacle_seen = True
-                blocked = await check.client.post(check.path(data, '/actions'), headers=check.headers(data), json={'action': 'resume'})
-                assert blocked.status_code == 409 and blocked.json()['error'] == 'OBSTACLE_PRESENT'
-                cleared = await check.action(data, 'obstacle_clear')
-                assert cleared['status'] == 'PAUSED' and not cleared['obstacle_active'] and cleared['distance_m'] == 32
+                fixed_obstacles = state['obstacles']
+                assert len(fixed_obstacles) == 1
+                original_points = state['navigation']['points']
+                # The board is 5m ahead of the dog's stopped position, and all
+                # prior path vertices survive the future-only replacement.
+                expected_obstacle = point_at(original_points, 37)
+                assert math.sqrt(sum((expected_obstacle[key] - fixed_obstacles[0]['point'][key]) ** 2 for key in ('x', 'y', 'z'))) < .001
+                bypass = await check.action(data, 'obstacle_bypass')
+                assert bypass['status'] == 'ACTIVE' and not bypass['obstacle_active'] and bypass['distance_m'] == 32
+                assert bypass['obstacles'] == fixed_obstacles and bypass['detour_until_m'] > 46.2
+                detour_navigation = bypass['navigation']
+                total = detour_navigation['total_distance_m']
+                assert total > 150
+                assert abs(path_length(detour_navigation['points']) - total) < .001
+                assert all(abs(end - step['end_m'] - (total - 150)) < .001
+                           for end, step in zip(detour_navigation['step_end_distances'], route['steps']))
+                for distance in (0, 10, 29.8, 32):
+                    original, updated = point_at(original_points, distance), point_at(detour_navigation['points'], distance)
+                    assert all(abs(original[key] - updated[key]) < 1e-8 for key in ('x', 'y', 'z'))
+                assert_obstacle_clearance(detour_navigation['points'], fixed_obstacles[0], 32, bypass['detour_until_m'])
+                repeated = await check.action(data, 'obstacle_bypass')
+                assert repeated['navigation'] == detour_navigation and repeated['obstacles'] == fixed_obstacles
+                duplicate = await check.client.post(check.path(data, '/actions'), headers=check.headers(data), json={'action': 'obstacle'})
+                assert duplicate.status_code == 409 and duplicate.json()['error'] == 'DETOUR_IN_PROGRESS'
+                paused = (await check.text(data, '暂停绕行'))['state']
+                assert paused['status'] == 'PAUSED' and paused['pause_reason'] == 'user'
                 await asyncio.sleep(0.3)
-                assert (await check.state(data))['distance_m'] == 32
+                refreshed = await check.state(data)
+                assert refreshed['distance_m'] == paused['distance_m']
+                assert refreshed['navigation'] == detour_navigation and refreshed['obstacles'] == fixed_obstacles
                 resumed = await check.action(data, 'resume')
-                assert resumed['status'] == 'ACTIVE'
+                assert resumed['status'] == 'ACTIVE' and resumed['navigation'] == detour_navigation
                 await live.wait(lambda: live.latest['revision'] >= resumed['revision'] and live.latest['status'] == 'ACTIVE')
-                report('PASS 32m 自动遇障；未清障禁止继续；清障保持原地；手动继续')
+                report(f'PASS 32m 自动遇障；障碍原位保留；真实弧长增至 {total:.4f}m；重复绕行不扩路；人狗沿同路径绕过；暂停/刷新/继续')
             elif state['status'] == 'DONE':
                 assert obstacle_seen
-                assert state['distance_m'] == 150 and state['current_step'] == len(route['steps'])
+                total = state['navigation']['total_distance_m']
+                assert state['distance_m'] == total and state['current_step'] == len(route['steps'])
+                assert state['detour_until_m'] is None
                 snapshot = await check.state(data)
-                assert snapshot['status'] == 'DONE' and snapshot['distance_m'] == 150
-                assert elapsed >= 124, 'Route ran faster than the real 1.2 m/s simulation'
+                assert snapshot['status'] == 'DONE' and snapshot['distance_m'] == total
+                assert snapshot['obstacles'] == fixed_obstacles
+                assert elapsed >= total / route['speed_mps'] - .3, 'Route ran faster than the real 1.2 m/s simulation'
                 assert live.pongs >= 8, 'Periodic JSON heartbeats did not receive enough replies'
-                report(f'PASS 完整路线 DONE，150m / 4步，实际耗时 {elapsed:.1f}s，JSON 心跳持续正常')
+                reset = await check.action(data, 'reset')
+                assert reset['status'] == 'IDLE' and reset['obstacles'] == [] and reset['distance_m'] == 0
+                assert reset['navigation']['points'] == route['points'] and reset['navigation']['total_distance_m'] == 150
+                report(f'PASS 完整路线 DONE，{total:.4f}m / {len(route["steps"])}步，实际耗时 {elapsed:.1f}s，障碍到终点仍保留，reset才清除，JSON 心跳持续正常')
                 break
             else:
                 assert state['status'] == 'ACTIVE'
             await asyncio.sleep(0.2)
+
+
+def path_length(points):
+    return sum(math.sqrt(sum((b[key] - a[key]) ** 2 for key in ('x', 'y', 'z'))) for a, b in zip(points, points[1:]))
+
+
+def point_at(points, distance):
+    for a, b in zip(points, points[1:]):
+        length = path_length([a, b])
+        if distance <= length:
+            return {key: a[key] + (b[key] - a[key]) * distance / length for key in ('x', 'y', 'z')}
+        distance -= length
+    return points[-1]
+
+
+def assert_obstacle_clearance(points, obstacle, start, until):
+    # Check both actor centres against the fixed 1.45m x .35m board footprint.
+    # This independently verifies the API geometry, not the browser rendering.
+    heading, centre = obstacle['heading'], obstacle['point']
+    for sample in range(301):
+        dog_distance = start + (until - start) * sample / 300
+        for distance in (dog_distance, max(0, dog_distance - 2.2)):
+            point = point_at(points, distance)
+            dx, dz = point['x'] - centre['x'], point['z'] - centre['z']
+            across = dx * math.cos(heading) - dz * math.sin(heading)
+            along = dx * math.sin(heading) + dz * math.cos(heading)
+            clearance = math.hypot(max(0, abs(across) - .725), max(0, abs(along) - .175))
+            assert clearance >= .65, f'Actor path overlaps the fixed obstacle: {clearance:.3f}m'
 
 
 async def run(args):

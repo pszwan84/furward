@@ -23,7 +23,7 @@ DEFAULT_WORLD = Path(__file__).resolve().parents[2] / 'shared' / 'route.json'
 
 class ActionRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    action: Literal['start', 'pause', 'resume', 'cancel', 'reset', 'obstacle', 'obstacle_clear']
+    action: Literal['start', 'pause', 'resume', 'cancel', 'reset', 'obstacle', 'obstacle_bypass', 'obstacle_clear']
 
 
 class TextRequest(BaseModel):

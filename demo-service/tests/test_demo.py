@@ -26,10 +26,10 @@ def world_path(tmp_path):
         'version': 1, 'coordinate_system': 'Y-up metres',
         'route': {'route_id': 'demo-city', 'total_distance_m': 150, 'speed_mps': 1.2,
                   'start_name': '西街口', 'destination_name': '街心花园', 'obstacle_distance_m': 32,
-                  'points': [{'x': 0, 'y': 0, 'z': 0}, {'x': 100, 'y': 0, 'z': 50}],
+                  'points': [{'x': 0, 'y': 0, 'z': 0}, {'x': 100, 'y': 0, 'z': 0}, {'x': 100, 'y': 0, 'z': 50}],
                   'steps': [{'index': 0, 'instruction': '向东走100米', 'start_m': 0, 'end_m': 100, 'distance_m': 100},
                             {'index': 1, 'instruction': '向南走50米', 'start_m': 100, 'end_m': 150, 'distance_m': 50}]},
-        'assets': {}, 'transform': {}, 'map': {},
+        'assets': {}, 'transform': {}, 'map': {}, 'detour_blockers': [],
     }), encoding='utf-8')
     return path
 
@@ -95,22 +95,22 @@ def test_two_visitors_are_isolated(registry, clock):
     assert all(item['session_id'] == b.session_id for item in list(qb._queue))
 
 
-def test_automatic_obstacle_requires_clear_then_resume(registry, clock):
+def test_automatic_obstacle_resume_plans_bypass_without_removing_obstacle(registry, clock):
     session, _, _ = create(registry)
     registry.action(session, 'start')
     advance_connected(registry, clock, 30)
     assert session.distance_m == 32
     assert (session.status, session.pause_reason) == ('PAUSED', 'obstacle')
-    with pytest.raises(DemoError, match='障碍仍在'):
-        registry.action(session, 'resume')
-    registry.action(session, 'obstacle_clear')
-    advance_connected(registry, clock, 30)
+    obstacle = session.snapshot()['obstacles']
+    advance_connected(registry, clock, 5)
     assert session.distance_m == 32 and session.status == 'PAUSED'
     registry.action(session, 'resume')
+    assert session.navigation['total_distance_m'] > 150 and session.detour_until_m > 44
     clock.advance(10)
     registry.tick()
     assert session.distance_m == pytest.approx(44)
     assert session.obstacle_triggered and not session.obstacle_active
+    assert session.obstacles == obstacle
 
 
 def test_cancel_preserves_position_and_reset_rearms_obstacle(registry, clock):
@@ -157,7 +157,7 @@ def test_arrival_clamps_to_end_and_requires_reset(registry, clock):
     registry.action(session, 'obstacle_clear')
     registry.action(session, 'resume')
     advance_connected(registry, clock, 1000)
-    assert session.status == 'DONE' and session.distance_m == 150 and session.current_step == 2
+    assert session.status == 'DONE' and session.distance_m == session.navigation['total_distance_m'] and session.current_step == 2
     assert '街心花园' in session.message
     with pytest.raises(DemoError):
         registry.action(session, 'start')

@@ -6,9 +6,10 @@ import { useEffect, useRef, useState, type RefObject } from 'react';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { angleDifference, pointAtDistance, type DemoState, type DemoWorld } from '@/lib/demo-types';
+import { angleDifference, pointAtDistance, GUIDE_FOLLOW_DISTANCE_M, type DemoState, type DemoWorld, type WorldPoint } from '@/lib/demo-types';
 import { createDemoFrameClock } from '@/lib/demo-frame-clock';
 import { collectFootContacts, groundFootContacts, restoreFootContacts, type FootContact } from '@/lib/foot-contact';
+import { createGuideConnection, type GuideConnection } from '@/lib/guide-connection';
 import styles from './experience.module.css';
 
 type Props = {
@@ -53,6 +54,12 @@ export default function CityScene({ world, stateRef, receivedAt, view }: Props) 
     let priorStatus = '';
     let snapCamera = true;
     const actors: Actor[] = [];
+    let guide: GuideConnection | undefined;
+    let loaded = false;
+    let lastSnapshot: DemoState | null | undefined;
+    let routeKey = '';
+    const obstacles = new Map<string, THREE.Group>();
+    const routeMeshes: THREE.Mesh[] = [];
     const groundMeshes: THREE.Mesh[] = [];
     const cityBounds = new THREE.Box3();
     const sceneryMeshes: THREE.Mesh[] = [];
@@ -83,7 +90,7 @@ export default function CityScene({ world, stateRef, receivedAt, view }: Props) 
     renderer.toneMappingExposure = 1.1;
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFShadowMap;
-    renderer.domElement.setAttribute('aria-label', '三维城市：绒途在前，人物沿路线跟随。可切换全景并拖动查看。');
+    renderer.domElement.setAttribute('aria-label', '三维城市：人物握着连接机器狗胸背带的牵引绳，沿同一路线行走并绕过障碍。可切换全景并拖动查看。');
     renderer.domElement.setAttribute('role', 'img');
     container.appendChild(renderer.domElement);
     const ambient = new THREE.HemisphereLight('#fff4df', '#a49d9e', 2.2);
@@ -117,20 +124,21 @@ export default function CityScene({ world, stateRef, receivedAt, view }: Props) 
     };
     pointMarker(0, '#25281f');
     pointMarker(world.route.total_distance_m, '#d2ff00');
-    const obstacle = new THREE.Group();
-    const obstacleBoard = new THREE.Mesh(new THREE.BoxGeometry(1.45, 0.7, 0.2), new THREE.MeshStandardMaterial({ color: '#e9a64d', roughness: 0.9 }));
-    obstacleBoard.position.y = 0.65;
-    obstacle.add(obstacleBoard);
-    for (const x of [-0.55, 0.55]) {
-      const leg = new THREE.Mesh(new THREE.BoxGeometry(0.13, 0.6, 0.35), new THREE.MeshStandardMaterial({ color: '#3c3b34' }));
-      leg.position.set(x, 0.3, 0);
-      obstacle.add(leg);
-    }
-    const obstaclePoint = pointAtDistance(world.route.points, world.route.obstacle_distance_m + 1.8);
-    obstacle.position.set(obstaclePoint.point.x, obstaclePoint.point.y, obstaclePoint.point.z);
-    obstacle.rotation.y = obstaclePoint.heading;
-    obstacle.visible = false;
-    scene.add(obstacle);
+    const makeObstacle = () => {
+      const obstacle = new THREE.Group();
+      const board = new THREE.Mesh(new THREE.BoxGeometry(1.45, 0.7, 0.2), new THREE.MeshStandardMaterial({ color: '#e9a64d', roughness: 0.9 }));
+      board.position.y = 0.65;
+      board.castShadow = true;
+      obstacle.add(board);
+      for (const x of [-0.55, 0.55]) {
+        const leg = new THREE.Mesh(new THREE.BoxGeometry(0.13, 0.6, 0.35), new THREE.MeshStandardMaterial({ color: '#3c3b34' }));
+        leg.position.set(x, 0.3, 0);
+        leg.castShadow = true;
+        obstacle.add(leg);
+      }
+      scene.add(obstacle);
+      return obstacle;
+    };
 
     const disposeObject = (root: THREE.Object3D) => {
       const textures = new Set<THREE.Texture>();
@@ -162,7 +170,7 @@ export default function CityScene({ world, stateRef, receivedAt, view }: Props) 
           object.castShadow = true;
           object.receiveShadow = true;
           if (object instanceof THREE.SkinnedMesh) object.frustumCulled = false;
-          if (/^(Continuous_Sidewalks|Ground_Extension_Seamless|Extended_Street_Network|Road_Main_4Segments|Crosswalks_7)$/.test(object.name)) groundMeshes.push(object);
+          if (/^(Continuous_Sidewalks|Ground_Extension_Seamless|Extended_Street_Network|Road_Main_4Segments|Crosswalks_7|Route_Pedestrian_Verge)$/.test(object.name)) groundMeshes.push(object);
           else if (!actor) sceneryMeshes.push(object);
         }
       });
@@ -193,6 +201,42 @@ export default function CityScene({ world, stateRef, receivedAt, view }: Props) 
         if (viewRef.current === 'overview') priorView = '';
       }
     };
+    const updateRoute = (points: WorldPoint[], total: number) => {
+      const key = JSON.stringify(points);
+      if (key === routeKey) return;
+      routeKey = key;
+      for (const mesh of routeMeshes) { scene.remove(mesh); disposeObject(mesh); }
+      routeMeshes.length = 0;
+      const path = new THREE.CurvePath<THREE.Vector3>();
+      let previous: THREE.Vector3 | undefined;
+      // Sample by actual arc length so the updated route and both walkers agree.
+      const samples = Math.ceil(total / 0.25);
+      for (let i = 0; i <= samples; i++) {
+        const p = pointAtDistance(points, Math.min(total, i * total / samples)).point;
+        const next = new THREE.Vector3(p.x, floorAt(p.x, p.z, p.y) + 0.055, p.z);
+        if (previous) path.add(new THREE.LineCurve3(previous, next));
+        previous = next;
+      }
+      const outline = new THREE.Mesh(new THREE.TubeGeometry(path, samples, 0.11, 4, false), new THREE.MeshBasicMaterial({ color: '#454d2f', depthWrite: false }));
+      const line = new THREE.Mesh(new THREE.TubeGeometry(path, samples, 0.065, 4, false), routeMaterial.clone());
+      outline.renderOrder = 2;
+      line.renderOrder = 3;
+      routeMeshes.push(outline, line);
+      scene.add(outline, line);
+    };
+    const updateObstacles = (state: DemoState | null) => {
+      const visible = new Set<string>();
+      for (const item of state?.obstacles ?? []) {
+        visible.add(item.id);
+        let obstacle = obstacles.get(item.id);
+        if (!obstacle) { obstacle = makeObstacle(); obstacles.set(item.id, obstacle); }
+        obstacle.position.set(item.point.x, floorAt(item.point.x, item.point.z, item.point.y), item.point.z);
+        obstacle.rotation.y = item.heading;
+      }
+      for (const [id, obstacle] of obstacles) {
+        if (!visible.has(id)) { scene.remove(obstacle); disposeObject(obstacle); obstacles.delete(id); }
+      }
+    };
     setPhase('正在载入城市与伙伴…');
     setFailure('');
     Promise.all([
@@ -202,22 +246,11 @@ export default function CityScene({ world, stateRef, receivedAt, view }: Props) 
     ]).then(() => {
       if (!cancelled) {
         for (const mark of surfaceMarks) mark.position.y = floorAt(mark.position.x, mark.position.z, mark.position.y) + 0.025;
-        const path = new THREE.CurvePath<THREE.Vector3>();
-        let previous: THREE.Vector3 | undefined;
-        // Drape the visible path onto the actual pavement, which has small height steps.
-        for (let d = 0; d <= world.route.total_distance_m; d += 0.5) {
-          const p = pointAtDistance(world.route.points, d).point;
-          const next = new THREE.Vector3(p.x, floorAt(p.x, p.z, p.y) + 0.055, p.z);
-          if (previous) path.add(new THREE.LineCurve3(previous, next));
-          previous = next;
-        }
-        const routeOutline = new THREE.Mesh(new THREE.TubeGeometry(path, 600, 0.11, 4, false), new THREE.MeshBasicMaterial({ color: '#454d2f', depthWrite: false }));
-        const routeLine = new THREE.Mesh(new THREE.TubeGeometry(path, 600, 0.065, 4, false), routeMaterial);
-        // A dark edge keeps lime readable on the warm pavement; normal depth still
-        // lets people and buildings occlude the line rather than painting over them.
-        routeOutline.renderOrder = 2;
-        routeLine.renderOrder = 3;
-        scene.add(routeOutline, routeLine);
+        const human = actors.find(actor => actor.root.userData.kind === 'human');
+        const dog = actors.find(actor => actor.root.userData.kind === 'dog');
+        if (human && dog) { guide = createGuideConnection(human.root, dog.root); scene.add(guide.rope); }
+        loaded = true;
+        lastSnapshot = undefined;
         setPhase('');
       }
     }).catch(reason => {
@@ -250,15 +283,22 @@ export default function CityScene({ world, stateRef, receivedAt, view }: Props) 
       const delta = frameClock.tick(now);
       if (delta === null) return;
       const state = stateRef.current;
+      const points = state?.navigation?.points ?? world.route.points;
+      const total = state?.navigation?.total_distance_m ?? world.route.total_distance_m;
+      if (loaded && state !== lastSnapshot) {
+        updateRoute(points, total);
+        updateObstacles(state);
+        lastSnapshot = state;
+      }
       // Prediction is bounded to 250ms; a stopped snapshot is applied exactly, never drifted.
       const age = Math.max(0, (now - receivedAt.current) / 1000);
       const active = state?.status === 'ACTIVE' && age < 1;
-      const distance = Math.min(world.route.total_distance_m, (state?.distance_m ?? 0) + (state?.status === 'ACTIVE' ? Math.min(age, 0.25) * world.route.speed_mps : 0));
-      const dogPoint = pointAtDistance(world.route.points, distance);
+      const distance = Math.min(total, (state?.distance_m ?? 0) + (state?.status === 'ACTIVE' ? Math.min(age, 0.25) * world.route.speed_mps : 0));
+      const dogPoint = pointAtDistance(points, distance);
       const stoppedNow = priorStatus === 'ACTIVE' && state?.status !== 'ACTIVE';
       for (const actor of actors) {
-        const offset = actor.root.userData.kind === 'human' ? -2.2 : 0;
-        const target = pointAtDistance(world.route.points, distance + offset, true);
+        const offset = actor.root.userData.kind === 'human' ? -GUIDE_FOLLOW_DISTANCE_M : 0;
+        const target = pointAtDistance(points, distance + offset, true);
         actor.root.position.set(target.point.x, floorAt(target.point.x, target.point.z, target.point.y) + 0.003, target.point.z);
         const turn = angleDifference(target.heading, actor.previousHeading);
         if (active && Math.abs(turn) > 0.45) {
@@ -281,19 +321,15 @@ export default function CityScene({ world, stateRef, receivedAt, view }: Props) 
         }
         restoreFootContacts(actor.feet);
         actor.mixer.update(delta);
+        if (actor.root.userData.kind === 'human') guide?.poseHand();
         // Crossfading two valid poses does not preserve their IK foot contacts.
         // Constrain the actual skinned soles after blending, without lifting the
         // whole character or changing the authoritative route distance.
         actor.root.updateMatrixWorld(true);
         groundFootContacts(actor.feet, floorAt, actor.root.position.y - 0.003);
       }
+      guide?.update();
       priorStatus = state?.status ?? '';
-      obstacle.visible = !!state?.obstacle_active;
-      if (obstacle.visible) {
-        const location = pointAtDistance(world.route.points, distance + 1.8);
-        obstacle.position.set(location.point.x, floorAt(location.point.x, location.point.z, location.point.y), location.point.z);
-        obstacle.rotation.y = location.heading;
-      }
       if (viewRef.current !== priorView) {
         priorView = viewRef.current;
         snapCamera = true;
@@ -310,12 +346,15 @@ export default function CityScene({ world, stateRef, receivedAt, view }: Props) 
         }
       }
       if (viewRef.current === 'follow') {
-        desiredTarget.set(dogPoint.point.x, dogPoint.point.y + 1, dogPoint.point.z);
         const heading = actors.find(actor => actor.root.userData.kind === 'dog')?.root.rotation.y ?? dogPoint.heading;
         const backwards = new THREE.Vector3(-Math.sin(heading), 0, -Math.cos(heading));
         const sideways = new THREE.Vector3(Math.cos(heading), 0, -Math.sin(heading));
-        desiredCamera.copy(desiredTarget).addScaledVector(backwards, 10).addScaledVector(sideways, 5.5);
-        desiredCamera.y += 8;
+        // A low trailing view keeps the street ahead visible while fitting both
+        // partners and their lead. The overview remains available for the city map.
+        desiredTarget.set(dogPoint.point.x, dogPoint.point.y + 1.1, dogPoint.point.z)
+          .addScaledVector(backwards, -3);
+        desiredCamera.set(dogPoint.point.x, dogPoint.point.y + 3.8, dogPoint.point.z)
+          .addScaledVector(backwards, 9).addScaledVector(sideways, 3.2);
         camera.position.lerp(desiredCamera, snapCamera || reduced ? 1 : 1 - Math.exp(-delta * 4));
         controls.target.lerp(desiredTarget, snapCamera || reduced ? 1 : 1 - Math.exp(-delta * 7));
         camera.lookAt(controls.target);
@@ -368,6 +407,7 @@ export default function CityScene({ world, stateRef, receivedAt, view }: Props) 
       for (const [mesh, original] of fadedMeshes) mesh.material = original;
       for (const faded of fadedMaterials.values()) for (const material of Array.isArray(faded) ? faded : [faded]) material.dispose();
       disposeObject(scene);
+      routeMaterial.dispose();
       sun.shadow.dispose();
       renderer.domElement.removeEventListener('webglcontextlost', onLost);
       renderer.dispose();

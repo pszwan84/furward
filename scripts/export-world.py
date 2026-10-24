@@ -6,9 +6,53 @@ Run from any directory with Python's standard library.
 import json
 import math
 import struct
+from itertools import product
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def detour_blockers():
+    """Project the delivered collision bodies onto XZ, conservatively at all heights."""
+    manifest = json.loads((ROOT / 'source-assets/city/assets/collision_manifest.json').read_text())
+
+    def hull(points):
+        points = sorted(set(points))
+        def cross(a, b, c):
+            return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+        def half(sequence):
+            result = []
+            for p in sequence:
+                while len(result) >= 2 and cross(result[-2], result[-1], p) <= 0:
+                    result.pop()
+                result.append(p)
+            return result
+        return half(points)[:-1] + half(reversed(points))[:-1]
+
+    result = []
+    for collider in manifest['colliders']:
+        if collider['shape'] == 'trimesh':
+            continue
+        if collider['shape'] == 'cuboid':
+            local = product(*[(-v, v) for v in collider['halfExtents']])
+        elif collider['shape'] == 'convexHull':
+            vertices = collider['vertices']
+            local = [vertices[i:i + 3] for i in range(0, len(vertices), 3)]
+        else:
+            raise ValueError('Unknown collision shape; detour clearance cannot be verified')
+        qx, qy, qz, qw = collider['rotation_xyzw']
+        px, _, pz = collider['position']
+        points = []
+        for x, y, z in local:
+            # Quaternion rotation q * v * q^-1 for the source's unit quaternion.
+            tx, ty, tz = 2 * (qy*z - qz*y), 2 * (qz*x - qx*z), 2 * (qx*y - qy*x)
+            points.append((x + qw*tx + qy*tz - qz*ty + px,
+                           z + qw*tz + qx*ty - qy*tx + pz))
+        polygon = hull(points)
+        if len(polygon) < 3:
+            raise ValueError('Degenerate obstacle footprint')
+        result.append(polygon)
+    return result
 
 
 def positions(data, gltf, binary_start, mesh):
@@ -71,6 +115,7 @@ def main():
         'transform': {'planar': ['x', '-z'], 'clockwise_degrees': -52,
                       'rotated_origin': origin, 'description': 'local2d = R(-52) * (world.x, -world.z) - rotated_origin'},
         'map': city,
+        'detour_blockers': detour_blockers(),
         'validation': {'max_rung_error_m': max(errors), 'rung_count': len(centres)},
     }
     dest = ROOT / 'shared/route.json'
