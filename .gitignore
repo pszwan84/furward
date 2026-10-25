@@ -14,3 +14,6 @@ outputs/
 backups/
 web/data/
 web/next-env.d.ts
+.taste-skill/
+*.blend1
+*.blend2
