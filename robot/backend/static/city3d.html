@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>城市 3D 展示 · 模拟</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0e1a1f; color: #e9f1f2; font: 14px/1.5 system-ui, "Microsoft YaHei", sans-serif; }
+  #stage { position: fixed; inset: 0; }
+  #bar { position: fixed; left: 0; right: 0; top: 0; padding: 8px 14px; background: rgba(8,20,24,.82); display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  #bar strong { font-size: 15px; }
+  .tag { padding: 2px 8px; border-radius: 10px; background: #e0b84a; color: #1b1500; font-weight: 600; }
+  #status { opacity: .9; }
+  #note { position: fixed; left: 14px; bottom: 12px; max-width: 520px; font-size: 12px; opacity: .8; }
+  #msg { position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none; text-align: center; padding: 24px; }
+</style>
+<script type="importmap">
+{ "imports": { "three": "/static/vendor/three/three.module.min.js" } }
+</script>
+</head>
+<body>
+<div id="stage"></div>
+<div id="bar">
+  <strong>城市 3D 展示</strong>
+  <span class="tag">模拟 · 非真实导航</span>
+  <span id="status">正在加载场景…</span>
+</div>
+<div id="note">这是静态展示场景：机器狗模型没有骨骼与动画，位置不代表真机位置。页面不发送任何控制命令。</div>
+<div id="msg"></div>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from '/static/vendor/three/jsm/loaders/GLTFLoader.js';
+
+const $ = (id) => document.getElementById(id);
+const setStatus = (t) => { $('status').textContent = t; };
+
+try {
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
+  $('stage').appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0xbfd6e0);
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x6b7a80, 1.1));
+  const sun = new THREE.DirectionalLight(0xffffff, 1.4);
+  sun.position.set(60, 120, 40);
+  scene.add(sun);
+
+  const base = '/static/city/';
+  const manifest = await (await fetch(base + 'scene_manifest.json')).json();
+  const loader = new GLTFLoader();
+  const load = (p) => loader.loadAsync(base + p);
+  const [core, periphery, placed] = await Promise.all([
+    load(manifest.files.core), load(manifest.files.periphery), load(manifest.files.characters_placed),
+  ]);
+  // Same world coordinates for every piece; never recentre or rescale (see delivery notes).
+  scene.add(core.scene, periphery.scene, placed.scene);
+
+  const dogSpawn = manifest.spawn.RobotDog.position_gltf;
+  const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 2000);
+  camera.position.set(dogSpawn[0] + 14, dogSpawn[1] + 9, dogSpawn[2] + 18);
+  camera.lookAt(dogSpawn[0], dogSpawn[1] + 1, dogSpawn[2]);
+
+  let yaw = 0;
+  const target = new THREE.Vector3(dogSpawn[0], dogSpawn[1] + 1, dogSpawn[2]);
+  addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+  renderer.setAnimationLoop(() => {
+    yaw += 0.0015;
+    const r = 24;
+    camera.position.set(target.x + Math.cos(yaw) * r, target.y + 9, target.z + Math.sin(yaw) * r);
+    camera.lookAt(target);
+    renderer.render(scene, camera);
+  });
+  setStatus('已加载：城市 + 外围 + 人物与机器狗（静态）');
+
+  // Read-only status from the backend; failure here must never affect the 3D view.
+  try {
+    const ws = new WebSocket((location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws/app');
+    ws.onmessage = (ev) => {
+      let e; try { e = JSON.parse(ev.data); } catch { return; }
+      if (e.type === 'hello' || e.type === 'robot.state') {
+        const robot = e.type === 'hello' ? e.data.robot : e.data;
+        setStatus('后端' + (robot && robot.online ? '在线' : '离线') + (robot && robot.simulated ? ' · 模拟' : ''));
+      }
+    };
+  } catch { /* ignore */ }
+  window.__cityReady = true;
+} catch (err) {
+  setStatus('场景加载失败');
+  $('msg').textContent = '无法加载 3D 场景：' + (err && err.message ? err.message : err);
+  window.__cityError = String(err && err.message ? err.message : err);
+}
+</script>
+</body>
+</html>

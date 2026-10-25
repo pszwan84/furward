@@ -1,0 +1,11 @@
+{
+  "reviewed": false,
+  "source": "guide_bridge",
+  "expected_source": "REPLACE_WITH_OBSERVED_SOURCE",
+  "priority": 30,
+  "domain_id": 0,
+  "source_timeout_ms": 500,
+  "rpc_timeout": 1.0,
+  "forward_speed": 0.21,
+  "angular_speed": 0.3
+}
